@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
-Fetches US market indices + top movers, screens them for recent analyst
-upgrades and net insider buying, and renders a static HTML dashboard.
-
-Data source: Yahoo Finance's public (undocumented) endpoints. No API key
-needed, but these endpoints can occasionally change shape or rate-limit —
-see README for a fallback plan if that happens.
+Fetches US market indices, top movers, niche watchlists, and screens
+S&P 500 / Nasdaq-100 / Dow 30 constituents for recent analyst upgrades and
+net insider buying. Renders a static HTML dashboard.
 
 Run manually with: python scripts/fetch_movers.py
 Normally triggered on a schedule by .github/workflows/market-report.yml
@@ -35,9 +32,61 @@ INDICES = {
     "Dow Jones": "%5EDJI",
 }
 
+NICHES = {
+    "Tech": ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSM", "AVGO", "ORCL", "CRM", "AMD", "PLTR"],
+    "Rare & critical metals": ["MP", "ALB", "SQM", "LAC", "FCX", "VALE", "SCCO", "TMC", "UUUU", "NEM", "PLL", "LYSCF"],
+    "Space & aerospace": ["RKLB", "BA", "LMT", "NOC", "RTX", "ASTS", "SPCE", "RDW", "IRDM", "KTOS", "AVAV", "LDOS"],
+    "Energy & uranium": ["CCJ", "UEC", "DNN", "NXE", "SMR", "OKLO", "LEU", "BWXT", "XOM", "CVX", "NEE", "UUUU"],
+}
+
 UPGRADE_LOOKBACK_DAYS = 7
 INSIDER_LOOKBACK_DAYS = 90
-MAX_SCREEN_CANDIDATES = 25
+MAX_SCREEN_CANDIDATES = 600
+MAX_CONSECUTIVE_FAILURES = 15
+
+
+def fetch_sp500_tickers():
+    url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    lines = r.text.strip().splitlines()[1:]
+    return [line.split(",")[0].strip() for line in lines if line.strip()]
+
+
+def fetch_nasdaq100_tickers():
+    url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    import re
+
+    tickers = re.findall(r'title="[^"]*"\s*>\s*([A-Z]{1,5})\s*</a>', r.text)
+    if len(tickers) < 50:
+        tickers = re.findall(r">([A-Z]{1,5})</td>", r.text)
+    return sorted(set(tickers))
+
+
+def fetch_dow30_tickers():
+    return [
+        "AAPL", "AMGN", "AMZN", "AXP", "BA", "CAT", "CRM", "CSCO", "CVX",
+        "DIS", "GS", "HD", "HON", "IBM", "JNJ", "JPM", "KO", "MCD", "MMM",
+        "MRK", "MSFT", "NKE", "NVDA", "PG", "SHW", "TRV", "UNH", "V", "VZ", "WMT",
+    ]
+
+
+def build_universe():
+    tickers = set()
+    for fetch_fn, label in [
+        (fetch_sp500_tickers, "S&P 500"),
+        (fetch_nasdaq100_tickers, "Nasdaq-100"),
+        (fetch_dow30_tickers, "Dow 30"),
+    ]:
+        try:
+            result = fetch_fn()
+            tickers.update(result)
+            print(f"Loaded {len(result)} tickers from {label}")
+        except Exception as e:
+            print(f"Failed to load {label} list: {e}")
+    return sorted(tickers)
 
 
 def fetch_screener(scr_id, count=10):
@@ -73,6 +122,39 @@ def fetch_index(symbol):
     prev = meta.get("chartPreviousClose") or meta.get("previousClose")
     change_pct = ((price - prev) / prev * 100) if price and prev else None
     return {"price": price, "change_pct": change_pct}
+
+
+def fetch_quotes_batch(symbols):
+    url = "https://query1.finance.yahoo.com/v7/finance/quote"
+    params = {"symbols": ",".join(symbols)}
+    r = requests.get(url, headers=HEADERS, params=params, timeout=15)
+    r.raise_for_status()
+    results = r.json().get("quoteResponse", {}).get("result", [])
+    rows = []
+    for q in results:
+        rows.append(
+            {
+                "symbol": q.get("symbol"),
+                "name": q.get("shortName", "") or q.get("symbol", ""),
+                "price": q.get("regularMarketPrice"),
+                "change_pct": q.get("regularMarketChangePercent"),
+                "volume": q.get("regularMarketVolume"),
+            }
+        )
+    return rows
+
+
+def fetch_niche_sections():
+    sections = {}
+    for niche, tickers in NICHES.items():
+        try:
+            rows = fetch_quotes_batch(tickers)
+            rows.sort(key=lambda r: abs(r["change_pct"] or 0), reverse=True)
+            sections[niche] = rows
+        except Exception as e:
+            print(f"Failed to fetch niche {niche}: {e}")
+            sections[niche] = []
+    return sections
 
 
 def fetch_analyst_and_insider(symbol):
@@ -117,33 +199,40 @@ def fetch_analyst_and_insider(symbol):
     }
 
 
-def build_signal_candidates(mover_sections):
-    seen = []
-    for rows in mover_sections.values():
-        for r in rows:
-            sym = r.get("symbol")
-            if sym and sym not in seen:
-                seen.append(sym)
-    return seen[:MAX_SCREEN_CANDIDATES]
-
-
 def screen_for_signals(candidates):
     hits = []
+    checked = 0
+    consecutive_failures = 0
     for sym in candidates:
+        if checked >= MAX_SCREEN_CANDIDATES:
+            print(f"Hit MAX_SCREEN_CANDIDATES ({MAX_SCREEN_CANDIDATES}), stopping.")
+            break
         try:
             info = fetch_analyst_and_insider(sym)
+            consecutive_failures = 0
         except Exception as e:
+            consecutive_failures += 1
             print(f"Skipping {sym}: {e}")
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                print(
+                    f"Hit {MAX_CONSECUTIVE_FAILURES} consecutive failures "
+                    "(likely rate-limited) — stopping scan early."
+                )
+                break
+            time.sleep(0.3)
             continue
+
+        checked += 1
         has_upgrade = len(info["recent_upgrades"]) > 0
         net_insider_buying = info["insider_buys"] > info["insider_sells"]
         if has_upgrade or net_insider_buying:
             hits.append(info)
         time.sleep(0.3)
-    return hits
+    print(f"Screened {checked} tickers, found {len(hits)} signal hits.")
+    return hits, checked
 
 
-def render_html(indices, sections, signal_hits):
+def render_html(indices, sections, niche_sections, signal_hits, screened_count, universe_count):
     now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     def index_card(name, d):
@@ -176,7 +265,7 @@ def render_html(indices, sections, signal_hits):
 
     def signal_table(hits):
         if not hits:
-            return "<p class='empty'>No signals among today's movers.</p>"
+            return "<p class='empty'>No signals found in this run.</p>"
         trs = ""
         for h in hits:
             upgrade_text = (
@@ -197,11 +286,18 @@ def render_html(indices, sections, signal_hits):
     sections_html = "".join(
         f"<section><h2>{title}</h2>{table(rows)}</section>" for title, rows in sections.items()
     )
+    niches_html = "".join(
+        f"<section><h2>{niche}</h2>"
+        f"<p class='note'>Sorted by biggest move today, up or down.</p>"
+        f"{table(rows)}</section>"
+        for niche, rows in niche_sections.items()
+    )
     indices_html = "".join(index_card(n, d) for n, d in indices.items())
     signals_html = (
         f"<section><h2>Analyst upgrades &amp; insider buying</h2>"
-        f"<p class='note'>Screened from today's movers only — not the whole "
-        f"market. Signals, not recommendations.</p>{signal_table(signal_hits)}</section>"
+        f"<p class='note'>Screened {screened_count} of {universe_count} S&amp;P 500 / "
+        f"Nasdaq-100 / Dow 30 tickers this run. Signals, not recommendations.</p>"
+        f"{signal_table(signal_hits)}</section>"
     )
 
     return f"""<!DOCTYPE html>
@@ -235,6 +331,7 @@ def render_html(indices, sections, signal_hits):
   <p class="timestamp">Generated {now} &middot; covers the US trading session</p>
   <div class="cards">{indices_html}</div>
   {sections_html}
+  {niches_html}
   {signals_html}
 </body>
 </html>"""
@@ -257,14 +354,17 @@ def main():
             print(f"Failed to fetch screener {title}: {e}")
             sections[title] = []
 
-    candidates = build_signal_candidates(sections)
-    signal_hits = screen_for_signals(candidates)
+    niche_sections = fetch_niche_sections()
 
-    html = render_html(indices, sections, signal_hits)
+    universe = build_universe()
+    print(f"Universe size: {len(universe)} unique tickers")
+    signal_hits, screened_count = screen_for_signals(universe)
+
+    html = render_html(indices, sections, niche_sections, signal_hits, screened_count, len(universe))
     os.makedirs("docs", exist_ok=True)
     with open("docs/index.html", "w") as f:
         f.write(html)
-    print(f"Wrote docs/index.html ({len(signal_hits)} signal hits from {len(candidates)} candidates)")
+    print(f"Wrote docs/index.html ({len(signal_hits)} signal hits)")
 
 
 if __name__ == "__main__":
